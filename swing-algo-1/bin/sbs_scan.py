@@ -151,7 +151,13 @@ FIB_STATE_PATH = os.path.join(TA_DIR, "fibonacci", "data",
 # oscillation around one line can't pile on legs (each such ADD also
 # wiped the failure slate, resetting the exit memory). Minor bump: the
 # ADD condition changed; the v3 family is unchanged.
-ALGO_VERSION = "3.1"
+# Bumped 3.1 -> 3.2 (2026-09-30): the ADD trigger selection now skips
+# blocked same/lower re-crosses and picks the first confirmed up-break
+# ABOVE the position's top_level. Previously the first eligible break
+# was selected and then guarded, so a blocked lower event earlier in the
+# list suppressed a valid higher ADD later in the list. Minor bump: the
+# ADD condition's event selection changed; the v3 family is unchanged.
+ALGO_VERSION = "3.2"
 
 # Set by --dry-run: suppresses ALL writes (state file + ledger).
 DRY_RUN = False
@@ -329,7 +335,7 @@ def already_consumed(consumed, ticker, kind, ident, day, basis, direction):
 # The user's conditions, applied to confirmed upstream recommendations
 # --------------------------------------------------------------------------
 
-def buy_condition(index_trend, stock_trend, fib_events):
+def buy_condition(index_trend, stock_trend, fib_events, top_level=None):
     """The buy-side trigger (BUY #1). Returns the trigger event or None.
 
     v3.0: AVWAP is out — the trigger is a confirmed break above any
@@ -337,13 +343,22 @@ def buy_condition(index_trend, stock_trend, fib_events):
     and the stock itself being in an uptrend. The same condition opens
     a fresh position (BUY) and, when a position is already open,
     recommends adding to it (ADD).
+
+    v3.1: for the ADD path, top_level is the position's pyramid-up memory.
+    Selection skips blocked same/lower re-crosses and returns the first
+    event ABOVE top_level — a blocked event earlier in the list must not
+    suppress a valid higher break later in the list. top_level=None
+    (fresh BUY, or legacy fail-open) keeps the first-eligible selection.
     """
     if index_trend != "uptrend":
         return None
     if stock_trend != "uptrend":
         return None
-    return next((e for e in fib_events
-                 if e["dir"] == "up" and e["pct"] in BUY_FIB_PCTS), None)
+    for e in fib_events:
+        if e["dir"] == "up" and e["pct"] in BUY_FIB_PCTS:
+            if top_level is None or add_above_top(e, top_level):
+                return e
+    return None
 
 
 _FIB_TRIG_RE = re.compile(r"fib ([\d.]+)% ([\d.]+)")
@@ -488,8 +503,8 @@ def evaluate(ticker, position, index_trend, index_sym, stock_trend,
         if (prev_stock_trend not in (None, "n/a", "downtrend")
                 and stock_trend == "downtrend"):
             return "SELL", trend_down_trigger(stock_trend), "trend_flip"
-        trig = buy_condition(index_trend, stock_trend, fib_events)
-        if trig and add_above_top(trig, top_level):
+        trig = buy_condition(index_trend, stock_trend, fib_events, top_level)
+        if trig:
             return "ADD", trig, "buy_condition"
         if len(failed_detail) == 1:
             trig = list(failed_detail.values())[-1]
