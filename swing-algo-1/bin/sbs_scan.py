@@ -157,7 +157,18 @@ FIB_STATE_PATH = os.path.join(TA_DIR, "fibonacci", "data",
 # was selected and then guarded, so a blocked lower event earlier in the
 # list suppressed a valid higher ADD later in the list. Minor bump: the
 # ADD condition's event selection changed; the v3 family is unchanged.
-ALGO_VERSION = "3.2"
+# Bumped 3.2 -> 3.3 (2026-09-30): SELL-side robustness. (a) The scan now
+# covers the union of the watchlist and open positions — a ticker
+# removed from the watchlist can no longer strand a position that can
+# never SELL; new BUY/ADD legs are still watchlist-only. (b) Missing or
+# stale fib data no longer skips the ticker: level-based logic is
+# skipped but the trend-based exits (index downtrend, stock trend flip)
+# still run, so a fib-scan outage can't freeze exits during a selloff.
+# (c) A stale ("n/a") trend reading no longer overwrites the last valid
+# trend in trend_watch, so one bad read can't permanently suppress the
+# downtrend-flip exit. Minor bump: exit coverage changed; entries
+# unchanged.
+ALGO_VERSION = "3.3"
 
 # Set by --dry-run: suppresses ALL writes (state file + ledger).
 DRY_RUN = False
@@ -317,18 +328,37 @@ def adapter_fib_breaks(fib_state, ticker, today, basis, consumed):
 
 
 def conf_key(ticker, kind, ident, day, basis, direction=None):
-    # v1.2: the direction is part of the key — a down-break and a later
-    # same-day up-reclaim of the same level are independent confirmations.
+    # v3.3: the day leads so the 500-key cap (sorted(consumed)[-500:])
+    # prunes the OLDEST keys, not the alphabetically-first tickers.
     # direction=None renders the legacy v1.1 key, still honored so
     # confirmations consumed before the upgrade stay consumed.
     if direction is None:
-        return f"{ticker}|{kind}|{ident}|{day}|{basis}"
-    return f"{ticker}|{kind}|{ident}|{direction}|{day}|{basis}"
+        return f"{day}|{ticker}|{kind}|{ident}|{basis}"
+    return f"{day}|{ticker}|{kind}|{ident}|{direction}|{basis}"
+
+
+def _candidate_keys(ticker, kind, ident, day, basis, direction):
+    """All key formats already_consumed must honor.
+
+    v3.3 moved the day to the front (see conf_key). The pre-v3.3
+    ticker-first formats are honored transiently so confirmations
+    consumed by an earlier run today stay consumed; they are
+    date-scoped, so they age out harmlessly via the cap.
+    """
+    keys = [conf_key(ticker, kind, ident, day, basis, direction),
+            conf_key(ticker, kind, ident, day, basis)]
+    if direction is None:
+        keys.append(f"{ticker}|{kind}|{ident}|{day}|{basis}")
+    else:
+        keys.append(f"{ticker}|{kind}|{ident}|{direction}|{day}|{basis}")
+        keys.append(f"{ticker}|{kind}|{ident}|{day}|{basis}")
+    return keys
 
 
 def already_consumed(consumed, ticker, kind, ident, day, basis, direction):
-    return (conf_key(ticker, kind, ident, day, basis, direction) in consumed
-            or conf_key(ticker, kind, ident, day, basis) in consumed)
+    return any(k in consumed
+               for k in _candidate_keys(ticker, kind, ident, day, basis,
+                                        direction))
 
 
 # --------------------------------------------------------------------------
@@ -474,7 +504,8 @@ def index_down_trigger(index_trend, index_sym):
 
 
 def evaluate(ticker, position, index_trend, index_sym, stock_trend,
-             prev_stock_trend, fib_events, failed_detail, top_level=None):
+             prev_stock_trend, fib_events, failed_detail, top_level=None,
+             allow_new_legs=True):
     """Apply the user's v3.0 buy/sell conditions.
 
     Returns (signal, trigger, reason). signal is BUY / ADD / SELL /
@@ -488,7 +519,10 @@ def evaluate(ticker, position, index_trend, index_sym, stock_trend,
     (BUY or ADD wipes the slate). top_level is the v3.1 pyramid-up
     memory: the highest fib level price already bought on this position —
     an ADD fires only on a break above a HIGHER level; None disables the
-    guard (legacy/unknown entries fail open).
+    guard (legacy/unknown entries fail open). allow_new_legs is False
+    for tickers no longer on the watchlist (v3.3): the scan still
+    evaluates their open positions for SELL/WATCH, but no new BUY or ADD
+    legs are opened — the watchlist defines the tradable universe.
     """
     if position is not None:
         if len(failed_detail) >= 2:
@@ -504,11 +538,13 @@ def evaluate(ticker, position, index_trend, index_sym, stock_trend,
                 and stock_trend == "downtrend"):
             return "SELL", trend_down_trigger(stock_trend), "trend_flip"
         trig = buy_condition(index_trend, stock_trend, fib_events, top_level)
-        if trig:
+        if allow_new_legs and trig:
             return "ADD", trig, "buy_condition"
         if len(failed_detail) == 1:
             trig = list(failed_detail.values())[-1]
             return "WATCH", trig, "one_failed_level"
+        return None, None, None
+    if not allow_new_legs:
         return None, None, None
     trig = buy_condition(index_trend, stock_trend, fib_events)
     if trig:
@@ -664,6 +700,12 @@ def scan(mode="daily"):
     else:
         sell_episodes = {}
         advisor_top_levels = {}
+    watchlist_set = set(tickers)
+    if not ADVISORY:
+        # v3.3: evaluate the union of the watchlist and open positions.
+        # A ticker removed from the watchlist keeps its position managed
+        # (SELL/WATCH still fire); new BUY/ADD legs stay watchlist-only.
+        tickers = sorted(watchlist_set | set(positions.keys()))
     history = state["history"]
     consumed = set(state.get("consumed", []))
     consumed_today = set()
@@ -715,57 +757,73 @@ def scan(mode="daily"):
 
     for ticker in sorted(tickers):
         f = fib_state.get(ticker)
-        if not f:
-            out["skipped"].append({"ticker": ticker, "reason": "no_scan_data"})
-            continue
-        fday = day_of(f.get("as_of"))
-        if not fday or fday != struct_day:
-            out["skipped"].append({"ticker": ticker,
-                                   "reason": "stale_scan_data"})
-            continue
-
+        fday = day_of(f.get("as_of")) if f else None
+        fib_ok = bool(f and fday and fday == struct_day)
         out["scanned"] += 1
-        as_of_counts[fday] = as_of_counts.get(fday, 0) + 1
 
-        # --- v3.1 failure tracking (fib levels only — AVWAP is out) ---
-        # A confirmed DOWN break through a fib level loses it; a confirmed
-        # UP break reclaims it. Only confirmations stamped AFTER the
-        # failure-window start (last BUY/ADD, or last anchor redraw) are
-        # folded in — pre-entry failures can never leak into a position.
-        # Rebuilt from the published log every run, so re-runs and days
-        # this skill missed stay safe. An anchor redraw moves the window
-        # start to now: the levels are different prices, so nothing
-        # confirmed before can fail the new ones. Legacy "vwap:*" keys
-        # from pre-3.0 state are dropped by the rebuild (only fib:* keys
-        # are ever added now).
-        sig_now = anchor_sig(f)
-        if level_anchors.get(ticker) not in (None, sig_now):
-            failed_since[ticker] = run_stamp
-        level_anchors[ticker] = sig_now
-        since = failed_since.get(ticker) or ""
-        fdet = {}
-        for r in (f.get("confirmed") or []):
-            if r.get("basis", "daily") != basis:
-                continue
-            if rec_stamp(r) <= since:
-                continue
-            lid = "fib:%.1f" % r["pct"]
-            if r.get("dir") == "down":
-                fdet.setdefault(lid, normalize_fib(r))
-            elif r.get("dir") == "up":
-                fdet.pop(lid, None)
-        failed_levels[ticker] = fdet
+        if fib_ok:
+            as_of_counts[fday] = as_of_counts.get(fday, 0) + 1
 
-        fib_events = adapter_fib_breaks(fib_state, ticker, today, basis,
-                                        consumed)
-        for e in fib_events:
-            consumed_today.add(conf_key(ticker, "fib", e["pct"], today,
-                                        basis, e["dir"]))
+            # --- v3.1 failure tracking (fib levels only — AVWAP is out) ---
+            # A confirmed DOWN break through a fib level loses it; a confirmed
+            # UP break reclaims it. Only confirmations stamped AFTER the
+            # failure-window start (last BUY/ADD, or last anchor redraw) are
+            # folded in — pre-entry failures can never leak into a position.
+            # Rebuilt from the published log every run, so re-runs and days
+            # this skill missed stay safe. An anchor redraw moves the window
+            # start to now: the levels are different prices, so nothing
+            # confirmed before can fail the new ones. Legacy "vwap:*" keys
+            # from pre-3.0 state are dropped by the rebuild (only fib:* keys
+            # are ever added now).
+            sig_now = anchor_sig(f)
+            if level_anchors.get(ticker) not in (None, sig_now):
+                failed_since[ticker] = run_stamp
+            level_anchors[ticker] = sig_now
+            since = failed_since.get(ticker) or ""
+            fdet = {}
+            for r in (f.get("confirmed") or []):
+                if r.get("basis", "daily") != basis:
+                    continue
+                if rec_stamp(r) <= since:
+                    continue
+                lid = "fib:%.1f" % r["pct"]
+                if r.get("dir") == "down":
+                    fdet.setdefault(lid, normalize_fib(r))
+                elif r.get("dir") == "up":
+                    fdet.pop(lid, None)
+            failed_levels[ticker] = fdet
+
+            fib_events = adapter_fib_breaks(fib_state, ticker, today, basis,
+                                            consumed)
+        else:
+            # v3.3: missing/stale fib data no longer skips the ticker.
+            # Level-based logic is skipped, but the trend-based exits
+            # (sector-index downtrend, stock trend flip) still run below
+            # with empty fib events — a fib-scan outage during a selloff
+            # must not freeze exits.
+            fdet = {}
+            fib_events = []
+
+        def consume_events():
+            # v3.3: a confirmation is consumed only once its ticker has
+            # been deliberately handled (signal, watch, or evaluated with
+            # no signal) — never on a path that skipped processing, so a
+            # later same-day run can retry it.
+            for e in fib_events:
+                consumed_today.add(conf_key(ticker, "fib", e["pct"], today,
+                                            basis, e["dir"]))
+
         index_sym = index_map.get(ticker, default_index)
         itrend = adapter_trend(trend_state, index_sym, today, struct_day)
         strend = adapter_trend(trend_state, ticker, today, struct_day)
         prev_stock_trend = trend_watch.get(ticker)
-        trend_watch[ticker] = strend["trend"]
+        if strend["trend"] != "n/a":
+            # v3.3: a stale reading must not overwrite the last valid
+            # trend — otherwise one "n/a" permanently suppresses the
+            # downtrend-flip exit (the next valid downtrend would be
+            # refused as "not a flip", and later reads see
+            # downtrend -> downtrend forever).
+            trend_watch[ticker] = strend["trend"]
 
         if ADVISORY:
             # Expire a finished SELL episode so a future one may fire.
@@ -791,12 +849,15 @@ def scan(mode="daily"):
         sig, trig, why = evaluate(ticker, position, itrend["trend"],
                                   index_sym, strend["trend"],
                                   prev_stock_trend,
-                                  fib_events, fdet, top_level)
+                                  fib_events, fdet, top_level,
+                                  ticker in watchlist_set)
         if sig is None:
+            consume_events()
             continue
         if sig == "WATCH":
             # Informational only: one failed level on an open position.
             # Never a ledger row, never a signal the sweeps relay.
+            consume_events()
             out["sell_watches"].append({
                 "ticker": ticker,
                 "failed": fmt_failed(fdet),
@@ -806,8 +867,11 @@ def scan(mode="daily"):
             continue
         price = trig.get("close") or strend["close"]
         if price is None:
+            # v3.3: skipped for lack of a price — NOT consumed, so a
+            # later same-day run can retry once prices are available.
             out["skipped"].append({"ticker": ticker, "reason": "no_price"})
             continue
+        consume_events()
 
         if sig == "BUY":
             positions[ticker] = {
