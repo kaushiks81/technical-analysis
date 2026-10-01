@@ -218,6 +218,29 @@ def expected_structure_date(fib_state):
     return max(counts, key=lambda d: counts[d])
 
 
+def expected_structure_date_trend(trend_state):
+    """Fallback structure date from the trend detector's state.
+
+    The trend detector runs before this skill in every sweep, so its
+    state carries the same daily-structure date the fib state would
+    have (e.g. last Friday for a Monday run), nested under
+    "tickers"/"indexes". Used ONLY so a total fib outage (empty fib
+    state) no longer aborts the intraday scan before the fib-independent
+    trend exits — every per-ticker check still fails closed without fib
+    data. Returns None when the trend state carries no usable date
+    either, which keeps the no_structure_date fail-closed behavior.
+    """
+    counts = {}
+    for section in ("tickers", "indexes"):
+        for e in ((trend_state or {}).get(section) or {}).values():
+            d = day_of((e or {}).get("as_of"))
+            if d:
+                counts[d] = counts.get(d, 0) + 1
+    if not counts:
+        return None
+    return max(counts, key=lambda d: counts[d])
+
+
 def _active_state_path():
     return ADVISOR_STATE_PATH if ADVISORY else STATE_PATH
 
@@ -328,13 +351,33 @@ def adapter_fib_breaks(fib_state, ticker, today, basis, consumed):
 
 
 def conf_key(ticker, kind, ident, day, basis, direction=None):
-    # v3.3: the day leads so the 500-key cap (sorted(consumed)[-500:])
-    # prunes the OLDEST keys, not the alphabetically-first tickers.
+    # v3.3: the day leads so the 500-key cap (sorted with
+    # _consumed_sort_key, [-500:]) prunes the OLDEST keys, not the
+    # alphabetically-first tickers.
     # direction=None renders the legacy v1.1 key, still honored so
     # confirmations consumed before the upgrade stay consumed.
     if direction is None:
         return f"{day}|{ticker}|{kind}|{ident}|{basis}"
     return f"{day}|{ticker}|{kind}|{ident}|{direction}|{basis}"
+
+
+def _consumed_sort_key(key):
+    """Sort key for the 500-key consumed cap: embedded day, then key.
+
+    v3.3 keys are date-first ({day}|...); pre-v3.3 keys are ticker-first
+    with the day as a later field. Digits sort before letters, so a
+    plain sorted() would retain legacy keys ahead of newer date-first
+    keys and evict today's confirmations first — the opposite of the
+    intended oldest-first pruning. Extract the embedded day from either
+    format so mixed sets still prune oldest-first. Keys with no
+    recognizable day sort first (evicted first), which is the safe
+    direction for unparseable entries.
+    """
+    for field in str(key).split("|"):
+        if (len(field) == 10 and field[4] == "-" and field[7] == "-"
+                and field.replace("-", "").isdigit()):
+            return (field, key)
+    return ("", key)
 
 
 def _candidate_keys(ticker, kind, ident, day, basis, direction):
@@ -343,7 +386,8 @@ def _candidate_keys(ticker, kind, ident, day, basis, direction):
     v3.3 moved the day to the front (see conf_key). The pre-v3.3
     ticker-first formats are honored transiently so confirmations
     consumed by an earlier run today stay consumed; they are
-    date-scoped, so they age out harmlessly via the cap.
+    date-scoped, and the cap prunes by embedded day (see
+    _consumed_sort_key), so they age out oldest-first like the rest.
     """
     keys = [conf_key(ticker, kind, ident, day, basis, direction),
             conf_key(ticker, kind, ident, day, basis)]
@@ -748,8 +792,15 @@ def scan(mode="daily"):
                 failed_since[ticker] = backfill_failed_since(
                     pos, f.get("confirmed"))
 
+    # v3.3 (review follow-up): a TOTAL fib outage (empty fib state) used to
+    # abort the whole intraday scan at the no_structure_date check below,
+    # freezing even the fib-independent trend exits. Fall back to the
+    # trend state's structure date so the exits still run; per-ticker fib
+    # logic still fails closed without fib data (fib_ok is False, no
+    # fib_events, no BUY).
     struct_day = (today if mode == "daily"
-                  else expected_structure_date(fib_state))
+                  else (expected_structure_date(fib_state)
+                        or expected_structure_date_trend(trend_state)))
     if not struct_day:
         out["skipped"].append({"ticker": "*",
                                "reason": "no_structure_date"})
@@ -1058,8 +1109,13 @@ def scan(mode="daily"):
     if not DRY_RUN:
         # Remember every confirmation seen today so a re-run never
         # double-fires a signal (whether or not it triggered one).
+        # v3.3 (review follow-up): prune by embedded day, not raw string
+        # order — plain sorted() keeps ticker-first legacy keys ahead of
+        # newer date-first keys (digits < letters) and would evict
+        # today's confirmations first.
         consumed |= consumed_today
-        state["consumed"] = sorted(consumed)[-500:]
+        state["consumed"] = sorted(consumed,
+                                   key=_consumed_sort_key)[-500:]
     save_state(state)
     return out
 

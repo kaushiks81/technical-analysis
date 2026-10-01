@@ -12,6 +12,16 @@ Covers the v3.3 SELL-side robustness batch:
   #6  the 500-key consumed cap prunes oldest-first (date-first keys),
       and pre-v3.3 ticker-first keys are still honored.
 
+Follow-up review round (folded into 3.3 — fixes based on code review,
+no version bump):
+  P1  a total fib outage (empty fib state) no longer aborts the intraday
+      scan at the no_structure_date check — the structure date falls back
+      to the trend state's date, so the fib-independent trend exits still
+      run;
+  P2  the 500-key consumed cap sorts by embedded day, so mixed
+      legacy/date-first key sets still prune oldest-first (plain sorted()
+      would retain legacy keys ahead of newer date-first keys).
+
 Run: python3 test_v33_sell_robustness.py
 """
 import json
@@ -280,22 +290,92 @@ check("#6 honors pre-v1.2 directionless keys",
 new_key = sbs.conf_key("AAA", "fib", 61.8, "2026-09-30", "daily", "up")
 check("#6 new keys are date-first",
       new_key.startswith("2026-09-30|"), new_key)
-# Date-first => sorted() orders by day: the cap keeps the newest.
+# Date-first => the cap's sort key orders by embedded day: the cap keeps
+# the newest.
 k_old = sbs.conf_key("ZZZ", "fib", 61.8, "2026-09-28", "daily", "up")
 k_new = sbs.conf_key("AAA", "fib", 61.8, "2026-09-30", "daily", "up")
 check("#6 older date sorts before newer regardless of ticker",
-      k_old < k_new, (k_old, k_new))
+      sbs._consumed_sort_key(k_old) < sbs._consumed_sort_key(k_new),
+      (k_old, k_new))
 bag = {sbs.conf_key("T%03d" % i, "fib", 61.8, "2026-09-28", "daily",
                     "up") for i in range(300)}
 bag |= {sbs.conf_key("T%03d" % i, "fib", 61.8, "2026-09-30", "daily",
                      "up") for i in range(300)}
-kept = set(sorted(bag)[-500:])
+kept = set(sorted(bag, key=sbs._consumed_sort_key)[-500:])
 evicted = bag - kept
 check("#6 500-key cap evicts oldest-first",
       len(kept) == 500 and
-      max(k[:10] for k in evicted) <= min(k[:10] for k in kept) and
+      max(sbs._consumed_sort_key(k)[0] for k in evicted) <=
+      min(sbs._consumed_sort_key(k)[0] for k in kept) and
       all(k.startswith("2026-09-28|") for k in evicted),
       (len(kept), len(evicted)))
+
+# ---------------------------------------------------------------- P1 (follow-up)
+# A TOTAL fib outage (empty fib state) in intraday mode used to abort the
+# whole scan at the no_structure_date check, freezing even the
+# fib-independent trend exits. The structure date now falls back to the
+# trend state's date, so the exits still run.
+h = Harness(TODAY)
+h.setup(
+    watchlist=["FFF"],
+    trend_tickers={
+        "FFF": make_trend("FFF", "downtrend", 90.0, TODAY),
+        "SPY": make_trend("SPY", "uptrend", 500.0, TODAY),
+    },
+    fib_entries={},  # total fib outage: empty state
+    positions={"FFF": make_position()},
+    trend_watch={"FFF": "uptrend"},
+)
+out = sbs.scan("intraday")
+sigs = h.signals(out)
+check("P1 intraday scan survives empty fib state",
+      out.get("scanned", 0) > 0 and
+      not any(s.get("reason") == "no_structure_date"
+              for s in out.get("skipped", [])),
+      out.get("skipped"))
+check("P1 trend-flip SELL fires with empty fib state (intraday)",
+      ("FFF", "SELL") in sigs, sigs)
+check("P1 SELL reason is trend_flip",
+      any(s.get("ticker") == "FFF" and "DOWNTREND" in s.get("trigger", "")
+          for s in out.get("sells", [])), out.get("sells"))
+
+# Index-downtrend exit with empty fib state, intraday mode.
+h = Harness(TODAY)
+h.setup(
+    watchlist=["GGG"],
+    trend_tickers={
+        "GGG": make_trend("GGG", "uptrend", 90.0, TODAY),
+        "SPY": make_trend("SPY", "downtrend", 490.0, TODAY),
+    },
+    fib_entries={},
+    positions={"GGG": make_position()},
+)
+out = sbs.scan("intraday")
+sigs = h.signals(out)
+check("P1 index-downtrend SELL fires with empty fib state (intraday)",
+      ("GGG", "SELL") in sigs, sigs)
+
+# ---------------------------------------------------------------- P2 (follow-up)
+# Mixed key formats: plain sorted() retains ticker-first legacy keys ahead
+# of newer date-first keys (digits < letters), evicting today's
+# confirmations first. The reviewer's reproduction — 500 legacy keys plus
+# one fresh date-first key — must keep the fresh key and evict oldest.
+bag = {"L%03d|fib|61.8|up|2026-09-28|daily" % i for i in range(500)}
+fresh = sbs.conf_key("AAA", "fib", 61.8, "2026-09-30", "daily", "up")
+bag.add(fresh)
+kept = set(sorted(bag, key=sbs._consumed_sort_key)[-500:])
+evicted = bag - kept
+check("P2 mixed-format cap keeps today's key",
+      fresh in kept and len(kept) == 500, (len(kept), len(evicted)))
+check("P2 mixed-format cap evicts oldest-first",
+      len(evicted) == 1 and
+      all(sbs._consumed_sort_key(k)[0] == "2026-09-28" for k in evicted),
+      list(evicted)[:3])
+# Sanity: the OLD code path would have failed this (plain sorted keeps
+# the legacy keys, evicting the fresh one).
+old_kept = set(sorted(bag)[-500:])
+check("P2 old plain-sorted cap would evict the fresh key",
+      fresh not in old_kept, "old path kept fresh key?!")
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 sys.exit(1 if FAIL else 0)

@@ -4,12 +4,16 @@ The **combiner** — the last skill in the pipeline. It takes the
 outputs of the skills that ran before it and turns them into swing
 **BUY** / **ADD** / **SELL** signals. Built 2026-09-25.
 
-**Algo version: 3.3** (bumped 2026-09-30: SELL-side robustness — the
-scan covers the watchlist ∪ open positions so a removed ticker's
-position can still exit, missing/stale fib data no longer freezes the
-trend-based exits, and a stale trend reading no longer poisons the
-flip-exit memory; v3.2 fixed the pyramid-up ADD trigger selection to
-skip blocked same/lower re-crosses; v3.1 made the ADD pyramid-up only;
+**Algo version: 3.3** (2026-09-30: fixes based on code review —
+SELL-side robustness: the scan covers the watchlist ∪ open positions so
+a removed ticker's position can still exit, missing/stale fib data no
+longer freezes the trend-based exits, and a stale trend reading no longer
+poisons the flip-exit memory; two follow-up review findings folded into
+3.3 with no version bump: a total fib outage no longer aborts the
+intraday scan (the structure date falls back to the trend state's date),
+and the consumed-confirmation cap prunes oldest-first across mixed key
+formats; v3.2 fixed the pyramid-up ADD trigger selection to skip blocked
+same/lower re-crosses; v3.1 made the ADD pyramid-up only;
 v3.0 took AVWAP out of the algorithm entirely — entries fire only on
 confirmed breaks above fib levels, and the level-based exit fires when
 **two fib levels have been lost since the last entry**; every BUY and
